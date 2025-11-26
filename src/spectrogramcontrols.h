@@ -78,4 +78,5 @@ public:
     QCheckBox *annoLabelCheckBox;
     QCheckBox *commentsCheckBox;
     QCheckBox *annoColorCheckBox;
+    QCheckBox *rfFreqCheckBox;
 };

@@ -29,8 +29,13 @@
 #include <algorithm>
 #include <functional>
 #include <cstdlib>
+#include <cmath>
 #include <limits>
 #include "util.h"
+#include "ffttask.h"
+
+// Static mutex to protect FFTW plan creation (FFTW is not thread-safe during planning)
+QMutex SpectrogramPlot::fftCreationMutex;
 
 
 SpectrogramPlot::SpectrogramPlot(std::shared_ptr<SampleSource<std::complex<float>>> src) : Plot(src), inputSource(src), fftSize(512), tuner(fftSize, this)
@@ -45,11 +50,30 @@ SpectrogramPlot::SpectrogramPlot(std::shared_ptr<SampleSource<std::complex<float
     sigmfAnnotationsEnabled = true;
     sigmfAnnotationLabels = true;
     sigmfAnnotationColors = true;
+    rfFreqEnabled = false;
 
     for (int i = 0; i < 256; i++) {
         float p = (float)i / 256;
         colormap[i] = QColor::fromHsvF(p * 0.83f, 1.0, 1.0 - p).rgba();
     }
+
+    // Set cache sizes large enough to handle high FFT sizes on large displays
+    // At fftSize=8192, each tile is only 8 pixels wide (65536/8192)
+    // A 4K display (3840px) would need ~480 tiles just for width
+    // Default QCache maxCost is 100, which causes cache thrashing
+    // Use 4000 to handle ultra-wide and multi-monitor setups at max FFT
+    fftCache.setMaxCost(4000);
+    pixmapCache.setMaxCost(4000);
+
+    // Initialize thread pool for async FFT computation
+    threadPool = QThreadPool::globalInstance();
+
+    // Initialize repaint throttling timer (16ms = ~60 FPS)
+    repaintTimer = new QTimer(this);
+    repaintTimer->setInterval(16);
+    repaintTimer->setSingleShot(true);
+    repaintPending = false;
+    connect(repaintTimer, &QTimer::timeout, this, &SpectrogramPlot::performRepaint);
 
     tunerTransform = std::make_shared<TunerTransform>(src);
     connect(&tuner, &Tuner::tunerMoved, this, &SpectrogramPlot::tunerMoved);
@@ -61,7 +85,18 @@ void SpectrogramPlot::invalidateEvent()
     setFFTSize(fftSize);
 
     pixmapCache.clear();
-    fftCache.clear();
+    {
+        QMutexLocker locker(&cacheMutex);
+        fftCache.clear();
+    }
+    {
+        QMutexLocker locker(&pendingMutex);
+        pendingTiles.clear();
+    }
+    {
+        QMutexLocker locker(&placeholderMutex);
+        placeholderTiles.clear();
+    }
     emit repaint();
 }
 
@@ -87,6 +122,12 @@ void SpectrogramPlot::paintFrequencyScale(QPainter &painter, QRect &rect)
         return;
     }
 
+    // Get center frequency if RF freq display is enabled
+    double centerFreq = 0.0;
+    if (rfFreqEnabled) {
+        centerFreq = inputSource->getFrequency();
+    }
+
     // At which pixel is F_+sampleRate/2
     int y = rect.y();
 
@@ -109,6 +150,20 @@ void SpectrogramPlot::paintFrequencyScale(QPainter &painter, QRect &rect)
     painter.setPen(pen);
     QFontMetrics fm(painter.font());
 
+    // Helper lambda to format frequency value
+    auto formatFreq = [](char *buf, size_t bufSize, double freq) {
+        double absFreq = fabs(freq);
+        const char *sign = freq < 0 ? "-" : " ";
+        if (absFreq >= 1000000000.0) {
+            snprintf(buf, bufSize, "%s%.3f GHz", sign, absFreq / 1000000000.0);
+        } else if (absFreq >= 1000000.0) {
+            snprintf(buf, bufSize, "%s%.3f MHz", sign, absFreq / 1000000.0);
+        } else if (absFreq >= 1000.0) {
+            snprintf(buf, bufSize, "%s%.3f kHz", sign, absFreq / 1000.0);
+        } else {
+            snprintf(buf, bufSize, "%s%.0f Hz", sign, absFreq);
+        }
+    };
 
     uint64_t tick = 0;
 
@@ -121,24 +176,39 @@ void SpectrogramPlot::paintFrequencyScale(QPainter &painter, QRect &rect)
             painter.drawLine(0, tickny, 30, tickny);
         painter.drawLine(0, tickpy, 30, tickpy);
 
-        if (tick != 0) {
-            char buf[128];
+        char buf[128];
 
-            if (bwPerTick % 1000000000 == 0) {
-                snprintf(buf, sizeof(buf), "-%lu GHz", tick / 1000000000);
-            } else if (bwPerTick % 1000000 == 0) {
-                snprintf(buf, sizeof(buf), "-%lu MHz", tick / 1000000);
-            } else if(bwPerTick % 1000 == 0) {
-                snprintf(buf, sizeof(buf), "-%lu kHz", tick / 1000);
-            } else {
-                snprintf(buf, sizeof(buf), "-%lu Hz", tick);
-            }
+        if (rfFreqEnabled && centerFreq != 0.0) {
+            // RF frequency mode - show actual RF frequencies
+            double freqUpper = centerFreq + tick;
+            double freqLower = centerFreq - tick;
 
-            if (!inputSource->realSignal())
-                painter.drawText(5, tickny - 5, buf);
-
-            buf[0] = ' ';
+            formatFreq(buf, sizeof(buf), freqUpper);
             painter.drawText(5, tickpy + 15, buf);
+
+            if (!inputSource->realSignal() && tick != 0) {
+                formatFreq(buf, sizeof(buf), freqLower);
+                painter.drawText(5, tickny - 5, buf);
+            }
+        } else {
+            // Baseband mode - show offset from center
+            if (tick != 0) {
+                if (bwPerTick % 1000000000 == 0) {
+                    snprintf(buf, sizeof(buf), "-%lu GHz", tick / 1000000000);
+                } else if (bwPerTick % 1000000 == 0) {
+                    snprintf(buf, sizeof(buf), "-%lu MHz", tick / 1000000);
+                } else if(bwPerTick % 1000 == 0) {
+                    snprintf(buf, sizeof(buf), "-%lu kHz", tick / 1000);
+                } else {
+                    snprintf(buf, sizeof(buf), "-%lu Hz", tick);
+                }
+
+                if (!inputSource->realSignal())
+                    painter.drawText(5, tickny - 5, buf);
+
+                buf[0] = ' ';
+                painter.drawText(5, tickpy + 15, buf);
+            }
         }
 
         tick += bwPerTick;
@@ -230,8 +300,9 @@ QString *SpectrogramPlot::mouseAnnotationComment(const QMouseEvent *event) {
 
 void SpectrogramPlot::paintMid(QPainter &painter, QRect &rect, range_t<size_t> sampleRange)
 {
-    if (!inputSource || inputSource->count() == 0)
+    if (!inputSource || inputSource->count() == 0) {
         return;
+    }
 
     size_t sampleOffset = sampleRange.minimum % (getStride() * linesPerTile());
     size_t tileID = sampleRange.minimum - sampleOffset;
@@ -252,45 +323,101 @@ void SpectrogramPlot::paintMid(QPainter &painter, QRect &rect, range_t<size_t> s
 
 QPixmap* SpectrogramPlot::getPixmapTile(size_t tile)
 {
-    QPixmap *obj = pixmapCache.object(TileCacheKey(fftSize, zoomLevel, nfftSkip, tile));
-    if (obj != 0)
-        return obj;
+    TileCacheKey key(fftSize, zoomLevel, nfftSkip, tile);
 
+    // Try to get FFT data
     float *fftTile = getFFTTile(tile);
-    obj = new QPixmap(linesPerTile(), fftSize);
-    QImage image(linesPerTile(), fftSize, QImage::Format_RGB32);
-    float powerRange = -1.0f / std::abs(int(powerMin - powerMax));
-    for (int y = 0; y < fftSize; y++) {
-        auto scanLine = (QRgb*)image.scanLine(fftSize - y - 1);
-        for (int x = 0; x < linesPerTile(); x++) {
-            float *fftLine = &fftTile[x * fftSize];
-            float normPower = (fftLine[y] - powerMax) * powerRange;
-            normPower = clamp(normPower, 0.0f, 1.0f);
 
-            scanLine[x] = colormap[(uint8_t)(normPower * (256 - 1))];
+    if (fftTile != nullptr) {
+        // FFT data is available
+        bool isPlaceholder = false;
+        {
+            QMutexLocker locker(&placeholderMutex);
+            isPlaceholder = placeholderTiles.contains(key);
         }
+
+        // If we have a real (non-placeholder) cached pixmap, return it
+        QPixmap *cachedPixmap = pixmapCache.object(key);
+        if (cachedPixmap != nullptr && !isPlaceholder) {
+            return cachedPixmap;
+        }
+
+        // Need to generate pixmap from FFT data
+        QPixmap *obj = new QPixmap(linesPerTile(), fftSize);
+        QImage image(linesPerTile(), fftSize, QImage::Format_RGB32);
+        float powerRange = -1.0f / std::abs(int(powerMin - powerMax));
+        for (int y = 0; y < fftSize; y++) {
+            auto scanLine = (QRgb*)image.scanLine(fftSize - y - 1);
+            for (int x = 0; x < linesPerTile(); x++) {
+                float *fftLine = &fftTile[x * fftSize];
+                float normPower = (fftLine[y] - powerMax) * powerRange;
+                normPower = clamp(normPower, 0.0f, 1.0f);
+
+                scanLine[x] = colormap[(uint8_t)(normPower * (256 - 1))];
+            }
+        }
+        obj->convertFromImage(image);
+        pixmapCache.insert(key, obj);
+
+        // Remove from placeholder set if it was there
+        {
+            QMutexLocker locker(&placeholderMutex);
+            placeholderTiles.remove(key);
+        }
+
+        return obj;
     }
-    obj->convertFromImage(image);
-    pixmapCache.insert(TileCacheKey(fftSize, zoomLevel, nfftSkip, tile), obj);
-    return obj;
+
+    // FFT data not ready - use placeholder
+    QPixmap *cachedPixmap = pixmapCache.object(key);
+    if (cachedPixmap != nullptr) {
+        // Already have a placeholder, return it
+        return cachedPixmap;
+    }
+
+    // Create new placeholder
+    QPixmap *placeholder = new QPixmap(linesPerTile(), fftSize);
+    placeholder->fill(Qt::black);
+    pixmapCache.insert(key, placeholder, 1);
+
+    // Mark as placeholder
+    {
+        QMutexLocker locker(&placeholderMutex);
+        placeholderTiles.insert(key);
+    }
+
+    return placeholder;
 }
 
 float* SpectrogramPlot::getFFTTile(size_t tile)
 {
-    std::array<float, tileSize>* obj = fftCache.object(TileCacheKey(fftSize, zoomLevel, nfftSkip, tile));
-    if (obj != nullptr)
-        return obj->data();
+    TileCacheKey key(fftSize, zoomLevel, nfftSkip, tile);
 
-    std::array<float, tileSize>* destStorage = new std::array<float, tileSize>;
-    float *ptr = destStorage->data();
-    size_t sample = tile;
-    while ((ptr - destStorage->data()) < tileSize) {
-        getLine(ptr, sample);
-        sample += getStride();
-        ptr += fftSize;
+    // Check cache first (thread-safe read)
+    {
+        QMutexLocker locker(&cacheMutex);
+        std::array<float, tileSize>* obj = fftCache.object(key);
+        if (obj != nullptr) {
+            // Cache hit
+            return obj->data();
+        }
     }
-    fftCache.insert(TileCacheKey(fftSize, zoomLevel, nfftSkip, tile), destStorage);
-    return destStorage->data();
+
+    // Check if already computing this tile AND mark as pending atomically
+    // This prevents race condition where multiple tasks could be started for same tile
+    {
+        QMutexLocker locker(&pendingMutex);
+        if (pendingTiles.contains(key)) {
+            // Tile is being computed, return nullptr for now
+            return nullptr;
+        }
+        // Mark as pending while still holding the lock
+        pendingTiles.insert(key);
+    }
+
+    // Start async computation (tile is already marked as pending)
+    startAsyncTileComputation(key);
+    return nullptr;
 }
 
 void SpectrogramPlot::getLine(float *dest, size_t sample)
@@ -330,19 +457,55 @@ void SpectrogramPlot::getLine(float *dest, size_t sample)
     }
 }
 
+void SpectrogramPlot::startAsyncTileComputation(const TileCacheKey &key)
+{
+    // Note: Tile is already marked as pending by getFFTTile() before calling this function
+    // This ensures atomic check-and-mark to prevent duplicate tasks
+
+    // Create and start async task
+    // Pass 'this' pointer so task can notify us via QMetaObject::invokeMethod
+    FFTTileTask *task = new FFTTileTask(
+        key.fftSize,
+        key.zoomLevel,
+        key.nfftSkip,
+        key.sample,
+        inputSource,
+        window.get(),
+        tileSize,
+        &fftCache,
+        &cacheMutex,
+        &pendingTiles,
+        &pendingMutex,
+        this
+    );
+
+    // Start task on thread pool
+    // When task completes, it will call onTileReady() via QMetaObject::invokeMethod
+    threadPool->start(task);
+}
+
 int SpectrogramPlot::getStride()
 {
+    if (zoomLevel == 0 || fftSize == 0) {
+        return 1; // Prevent division by zero
+    }
     return fftSize * nfftSkip / zoomLevel;
 }
 
 float SpectrogramPlot::getTunerPhaseInc()
 {
+    if (fftSize == 0) {
+        return 0.0f; // Prevent division by zero
+    }
     auto freq = 0.5f - tuner.centre() / (float)fftSize;
     return freq * Tau;
 }
 
 std::vector<float> SpectrogramPlot::getTunerTaps()
 {
+    if (fftSize == 0) {
+        return std::vector<float>(1, 1.0f); // Return minimal valid filter
+    }
     float cutoff = tuner.deviation() / (float)fftSize;
     float gain = pow(10.0f, powerMax / -10.0f);
     auto atten = 60.0f;
@@ -356,6 +519,9 @@ std::vector<float> SpectrogramPlot::getTunerTaps()
 
 int SpectrogramPlot::linesPerTile()
 {
+    if (fftSize == 0) {
+        return 1; // Prevent division by zero
+    }
     return tileSize / fftSize;
 }
 
@@ -374,9 +540,21 @@ std::shared_ptr<AbstractSampleSource> SpectrogramPlot::output()
 
 void SpectrogramPlot::setFFTSize(int size)
 {
+    // Ensure valid FFT size
+    if (size < 2) {
+        size = 2;
+    }
+
+    qDebug() << "SpectrogramPlot::setFFTSize() - FFT size changed to:" << size;
+
     float sizeScale = float(size) / float(fftSize);
     fftSize = size;
-    fft.reset(new FFT(fftSize));
+
+    // Protect FFTW plan creation with mutex (not thread-safe)
+    {
+        QMutexLocker locker(&fftCreationMutex);
+        fft.reset(new FFT(fftSize));
+    }
 
     window.reset(new float[fftSize]);
     for (int i = 0; i < fftSize; i++) {
@@ -393,29 +571,89 @@ void SpectrogramPlot::setFFTSize(int size)
     tuner.setHeight(height());
     tuner.setDeviation( dev * sizeScale );
     tuner.setCentre( centre * sizeScale );
+
+    // Clear caches since FFT size changed - old tiles are invalid
+    pixmapCache.clear();
+    {
+        QMutexLocker locker(&cacheMutex);
+        fftCache.clear();
+    }
+    {
+        QMutexLocker locker(&pendingMutex);
+        pendingTiles.clear();
+    }
+    {
+        QMutexLocker locker(&placeholderMutex);
+        placeholderTiles.clear();
+    }
 }
 
 void SpectrogramPlot::setPowerMax(int power)
 {
+    qDebug() << "SpectrogramPlot::setPowerMax() - Power max changed to:" << power << "dB";
     powerMax = power;
     pixmapCache.clear();
+    {
+        QMutexLocker locker(&placeholderMutex);
+        placeholderTiles.clear();
+    }
+    // No need to clear FFT cache, only pixmap rendering changes
     tunerMoved();
 }
 
 void SpectrogramPlot::setPowerMin(int power)
 {
+    qDebug() << "SpectrogramPlot::setPowerMin() - Power min changed to:" << power << "dB";
     powerMin = power;
     pixmapCache.clear();
+    {
+        QMutexLocker locker(&placeholderMutex);
+        placeholderTiles.clear();
+    }
+    // No need to clear FFT cache, only pixmap rendering changes
+    emit repaint();
 }
 
 void SpectrogramPlot::setZoomLevel(int zoom)
 {
+    qDebug() << "SpectrogramPlot::setZoomLevel() - Zoom level changed to:" << zoom;
     zoomLevel = zoom;
+
+    // Clear caches since zoom affects tile stride calculations
+    pixmapCache.clear();
+    {
+        QMutexLocker locker(&cacheMutex);
+        fftCache.clear();
+    }
+    {
+        QMutexLocker locker(&pendingMutex);
+        pendingTiles.clear();
+    }
+    {
+        QMutexLocker locker(&placeholderMutex);
+        placeholderTiles.clear();
+    }
 }
 
 void SpectrogramPlot::setSkip(int skip)
 {
+    qDebug() << "SpectrogramPlot::setSkip() - Skip changed to:" << skip;
     nfftSkip = skip;
+
+    // Clear caches since skip affects tile stride calculations
+    pixmapCache.clear();
+    {
+        QMutexLocker locker(&cacheMutex);
+        fftCache.clear();
+    }
+    {
+        QMutexLocker locker(&pendingMutex);
+        pendingTiles.clear();
+    }
+    {
+        QMutexLocker locker(&placeholderMutex);
+        placeholderTiles.clear();
+    }
 }
 
 void SpectrogramPlot::setSampleRate(double rate)
@@ -448,6 +686,11 @@ void SpectrogramPlot::enableAnnoColors(bool enabled)
     sigmfAnnotationColors = enabled;
 }
 
+void SpectrogramPlot::enableRfFreq(bool enabled)
+{
+    rfFreqEnabled = enabled;
+}
+
 bool SpectrogramPlot::tunerEnabled()
 {
     return (tunerTransform->subscriberCount() > 0);
@@ -465,7 +708,24 @@ void SpectrogramPlot::tunerMoved()
     emit repaint();
 }
 
+void SpectrogramPlot::onTileReady()
+{
+    // Tile completed in background, schedule a throttled repaint
+    // Don't trigger immediate repaint - use timer to batch multiple tile completions
+    if (!repaintPending) {
+        repaintPending = true;
+        repaintTimer->start();
+    }
+}
+
+void SpectrogramPlot::performRepaint()
+{
+    // Actually emit the repaint signal (throttled to max 60 FPS)
+    repaintPending = false;
+    emit repaint();
+}
+
 uint qHash(const TileCacheKey &key, uint seed)
 {
-    return key.fftSize ^ key.zoomLevel ^ key.sample ^ seed;
+    return key.fftSize ^ key.zoomLevel ^ key.nfftSkip ^ key.sample ^ seed;
 }

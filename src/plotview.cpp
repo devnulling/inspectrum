@@ -685,7 +685,15 @@ void PlotView::enableAnnoColors(bool enabled)
 {
     if (spectrogramPlot != nullptr)
         spectrogramPlot->enableAnnoColors(enabled);
-    
+
+    viewport()->update();
+}
+
+void PlotView::enableRfFreq(bool enabled)
+{
+    if (spectrogramPlot != nullptr)
+        spectrogramPlot->enableRfFreq(enabled);
+
     viewport()->update();
 }
 

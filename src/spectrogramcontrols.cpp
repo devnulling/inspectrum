@@ -105,6 +105,8 @@ SpectrogramControls::SpectrogramControls(const QString & title, QWidget * parent
     layout->addRow(new QLabel(tr("Annotation comments:")), commentsCheckBox);
     annoColorCheckBox = new QCheckBox(widget);
     layout->addRow(new QLabel(tr("Annotation Colors:")), annoColorCheckBox);
+    rfFreqCheckBox = new QCheckBox(widget);
+    layout->addRow(new QLabel(tr("RF Freq:")), rfFreqCheckBox);
 
     widget->setLayout(layout);
     setWidget(widget);

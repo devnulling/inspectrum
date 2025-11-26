@@ -20,7 +20,11 @@
 #pragma once
 
 #include <QCache>
+#include <QMutex>
+#include <QSet>
 #include <QString>
+#include <QThreadPool>
+#include <QTimer>
 #include <QWidget>
 #include "fft.h"
 #include "inputsource.h"
@@ -55,7 +59,11 @@ public:
     void enableAnnoLabels(bool enabled);
     bool isAnnotationsEnabled();
     void enableAnnoColors(bool enabled);
+    void enableRfFreq(bool enabled);
     QString *mouseAnnotationComment(const QMouseEvent *event);
+
+    // Public mutex for FFTW thread safety (accessed by FFTTileTask)
+    static QMutex fftCreationMutex;
 
 public slots:
     void setFFTSize(int size);
@@ -64,6 +72,10 @@ public slots:
     void setZoomLevel(int zoom);
     void setSkip(int skip);
     void tunerMoved();
+    void onTileReady();
+
+private slots:
+    void performRepaint();
 
 private:
     const int linesPerGraduation = 50;
@@ -77,6 +89,18 @@ private:
     QCache<TileCacheKey, std::array<float, tileSize>> fftCache;
     uint colormap[256];
 
+    // Threading support
+    QThreadPool *threadPool;
+    QMutex cacheMutex;
+    QMutex pendingMutex;
+    QMutex placeholderMutex;
+    QSet<TileCacheKey> pendingTiles;
+    QSet<TileCacheKey> placeholderTiles;  // Track which tiles have placeholder pixmaps
+
+    // Repaint throttling
+    QTimer *repaintTimer;
+    bool repaintPending;
+
     int fftSize;
     int zoomLevel;
     int nfftSkip;
@@ -87,6 +111,7 @@ private:
     bool sigmfAnnotationsEnabled;
     bool sigmfAnnotationLabels;
     bool sigmfAnnotationColors;
+    bool rfFreqEnabled;
 
     Tuner tuner;
     std::shared_ptr<TunerTransform> tunerTransform;
@@ -94,6 +119,7 @@ private:
     QPixmap* getPixmapTile(size_t tile);
     float* getFFTTile(size_t tile);
     void getLine(float *dest, size_t sample);
+    void startAsyncTileComputation(const TileCacheKey &key);
     int getStride();
     float getTunerPhaseInc();
     std::vector<float> getTunerTaps();
@@ -125,6 +151,9 @@ public:
     int nfftSkip;
     size_t sample;
 };
+
+// Hash function for TileCacheKey (needed for QSet and QHash)
+uint qHash(const TileCacheKey &key, uint seed = 0);
 
 class AnnotationLocation
 {

@@ -50,6 +50,7 @@ public slots:
     void enableAnnoLabels(bool enabled);
     void enableAnnotationCommentsTooltips(bool enabled);
     void enableAnnoColors(bool enabled);
+    void enableRfFreq(bool enabled);
     void invalidateEvent() override;
     void repaint();
     void setCursorSegments(int segments);
